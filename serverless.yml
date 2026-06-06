@@ -1,0 +1,250 @@
+service: agenda-api
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 512
+  timeout: 10
+  logRetentionInDays: 14
+
+  environment:
+    NODE_ENV: ${self:provider.stage}
+    AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+    DYNAMODB_TABLE_APPOINTMENTS: ${self:custom.tables.appointments}
+    DYNAMODB_TABLE_CONTACTS: ${self:custom.tables.contacts}
+    RABBITMQ_EXCHANGE: agenda.events
+    RABBITMQ_URL: ${ssm:/agenda/${self:provider.stage}/rabbitmq-url, 'amqp://guest:guest@localhost:5672'}
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:Scan
+          Resource:
+            - !GetAtt AppointmentsTable.Arn
+            - !Sub '${AppointmentsTable.Arn}/index/*'
+            - !GetAtt ContactsTable.Arn
+            - !Sub '${ContactsTable.Arn}/index/*'
+
+custom:
+  tables:
+    appointments: agenda-appointments-${self:provider.stage}
+    contacts: agenda-contacts-${self:provider.stage}
+
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    exclude:
+      - '@aws-sdk/*'
+    target: node20
+    platform: node
+    concurrency: 10
+
+  serverless-offline:
+    httpPort: 3000
+    lambdaPort: 3002
+    noPrependStageInUrl: true
+
+plugins:
+  - serverless-esbuild
+  - serverless-offline
+
+functions:
+  # Appointments
+  createAppointment:
+    handler: src/interfaces/lambda/handlers/appointment.create
+    description: Create a new appointment
+    events:
+      - http:
+          method: POST
+          path: /appointments
+          cors: true
+
+  listAppointments:
+    handler: src/interfaces/lambda/handlers/appointment.list
+    description: List appointments for authenticated user
+    events:
+      - http:
+          method: GET
+          path: /appointments
+          cors: true
+
+  getAppointment:
+    handler: src/interfaces/lambda/handlers/appointment.getById
+    description: Get appointment by ID
+    events:
+      - http:
+          method: GET
+          path: /appointments/{id}
+          cors: true
+
+  updateAppointment:
+    handler: src/interfaces/lambda/handlers/appointment.update
+    description: Update appointment details
+    events:
+      - http:
+          method: PUT
+          path: /appointments/{id}
+          cors: true
+
+  cancelAppointment:
+    handler: src/interfaces/lambda/handlers/appointment.cancel
+    description: Cancel an appointment
+    timeout: 10
+    events:
+      - http:
+          method: DELETE
+          path: /appointments/{id}
+          cors: true
+
+  # Contacts
+  createContact:
+    handler: src/interfaces/lambda/handlers/contact.create
+    description: Create a new contact
+    events:
+      - http:
+          method: POST
+          path: /contacts
+          cors: true
+
+  listContacts:
+    handler: src/interfaces/lambda/handlers/contact.list
+    description: List contacts for authenticated user
+    events:
+      - http:
+          method: GET
+          path: /contacts
+          cors: true
+
+  getContact:
+    handler: src/interfaces/lambda/handlers/contact.getById
+    description: Get contact by ID
+    events:
+      - http:
+          method: GET
+          path: /contacts/{id}
+          cors: true
+
+  # Async consumers
+  processNotification:
+    handler: src/interfaces/lambda/handlers/notification.process
+    description: Process notification events from SQS
+    timeout: 60
+    memorySize: 256
+    events:
+      - sqs:
+          arn: !GetAtt AppointmentNotificationsQueue.Arn
+          batchSize: 10
+          functionResponseType: ReportBatchItemFailures
+
+  # Scheduled jobs
+  sendReminders:
+    handler: src/interfaces/lambda/handlers/reminder.send
+    description: Send appointment reminders (runs every 15 minutes)
+    timeout: 300
+    memorySize: 256
+    events:
+      - schedule:
+          rate: rate(15 minutes)
+          enabled: ${param:remindersEnabled, true}
+
+resources:
+  Resources:
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.tables.appointments}
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK
+            AttributeType: S
+          - AttributeName: GSI1SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: userId-startDate-index
+            KeySchema:
+              - AttributeName: GSI1PK
+                KeyType: HASH
+              - AttributeName: GSI1SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Service
+            Value: agenda-api
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    ContactsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.tables.contacts}
+        BillingMode: PAY_PER_REQUEST
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        Tags:
+          - Key: Service
+            Value: agenda-api
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    AppointmentNotificationsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: agenda-notifications-${self:provider.stage}
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 86400
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt AppointmentNotificationsDLQ.Arn
+          maxReceiveCount: 3
+
+    AppointmentNotificationsDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: agenda-notifications-dlq-${self:provider.stage}
+        MessageRetentionPeriod: 1209600
+
+  Outputs:
+    AppointmentsTableName:
+      Value: !Ref AppointmentsTable
+    ContactsTableName:
+      Value: !Ref ContactsTable
+    NotificationsQueueUrl:
+      Value: !Ref AppointmentNotificationsQueue
+    ServiceEndpoint:
+      Description: URL of the service endpoint
+      Value: !Sub 'https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}'
