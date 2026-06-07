@@ -17,7 +17,8 @@ provider:
     DYNAMODB_TABLE_APPOINTMENTS: ${self:custom.tables.appointments}
     DYNAMODB_TABLE_CONTACTS: ${self:custom.tables.contacts}
     RABBITMQ_EXCHANGE: agenda.events
-    RABBITMQ_URL: ${ssm:/agenda/${self:provider.stage}/rabbitmq-url, 'amqp://guest:guest@localhost:5672'}
+    RABBITMQ_URL: ${env:RABBITMQ_URL, 'amqp://guest:guest@localhost:5672'}
+    DYNAMODB_ENDPOINT: ${env:DYNAMODB_ENDPOINT, 'http://localhost:8000'}
 
   iam:
     role:

@@ -5,3 +5,5 @@ dist/
 *.js.map
 coverage/
 .nyc_output/
+.esbuild/
+package-lock.json
